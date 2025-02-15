@@ -63,8 +63,8 @@ class Query:
         self.db = data.DB(data_dir, readonly=True, dtscomp=self.dts_comp_support)
         self.file_cache = {}
 
-    def script(self, *args):
-        return script(*args, env=self.getEnv())
+    def script(self, *args, input=None):
+        return script(*args, input=input, env=self.getEnv())
 
     def scriptLines(self, *args):
         return scriptLines(*args, env=self.getEnv())
@@ -403,7 +403,29 @@ class Query:
             symbol_doccomments.append(SymbolInstance(path, docline))
 
         return symbol_definitions, symbol_references, symbol_doccomments
-    
+
+    def get_files_and_zip(self, version, syms):
+        batch = b"\n".join([f"{version}:{sym.path}".encode() for sym in syms])
+        batch_res = self.script('get-files-batch', input=batch)
+
+        # See https://git-scm.com/docs/git-cat-file#_batch_output for the format:
+        #
+        # <oid> SP <type> SP <size> LF
+        # <contents> LF
+        # <oid> SP <type> SP <size> LF
+        # <contents> LF
+        # <oid> SP <type> SP <size> LF
+        # <contents> LF
+        # 
+        for sym in syms:
+            meta, batch_res = batch_res.split(b"\n", 1)
+            _, _, size = meta.split(b" ")
+            size = int(size) + 1 # newline after each file
+            content = batch_res[:size].split(b"\n")
+            batch_res = batch_res[size:]
+            yield sym, content
+
+
     def get_peeks_of_syms(self, version, symbol_definitions, symbol_references):
 
         peeks = {}
@@ -411,11 +433,10 @@ class Query:
         def request_peeks(syms):
             if len(syms) > 100:
                 return
-            for sym in syms:
+
+            for sym, content in self.get_files_and_zip(version, syms):
                 if sym.path not in peeks:
                     peeks[sym.path] = {}
-
-                content = self.scriptLines('get-file', version, "/" + sym.path)
 
                 if type(sym.line) is int:
                     lines = (sym.line,)
@@ -455,6 +476,24 @@ def cmd_file(q, version, path, **kwargs):
     code = q.query("file", version, path)
     print(code)
 
+def profile(q, family, version, ident):
+    return q.query('ident', version, ident, family)
+
+def cmd_profile(q, family, version, ident, **kwargs):
+    import cProfile
+    cProfile.runctx('profile(q, family, version, ident)',
+                    globals={
+                        "profile": profile
+                    },
+                    locals={
+                        "q": q,
+                        "family": family,
+                        "version": version,
+                        "ident": ident,
+                    },
+                    sort='tottime'
+    )
+
 if __name__ == "__main__":
     import argparse
 
@@ -472,6 +511,11 @@ if __name__ == "__main__":
     file_subparser = subparsers.add_parser('file', help="Get a source file")
     file_subparser.add_argument('path', type=str, help="The path of the source file")
     file_subparser.set_defaults(func=cmd_file, q=query)
+
+    profile_subparser = subparsers.add_parser('perf', help="Get a source file")
+    profile_subparser.add_argument('ident', type=str, help="The name of the identifier")
+    profile_subparser.add_argument('family', type=str, help="The file family requested")
+    profile_subparser.set_defaults(func=cmd_profile, q=query)
 
     args = parser.parse_args()
     args.func(**vars(args))
